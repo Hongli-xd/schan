@@ -1,10 +1,14 @@
 /**
- * WebSocket Server - 实现完整小智协议
- * 每个连接创建一个 Session
+ * WebSocket Server - xiaozhi protocol server
+ *
+ * Handles WebSocket connections from xiaozhi-esp32 devices
+ * Validates headers and creates per-connection sessions
+ *
+ * Reference: xiaozhi-esp32/main/protocols/websocket_protocol.cc
  */
 
 import { createServer, type Server as HttpServer } from "node:http";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, type WebSocket } from "ws";
 import type { Logger } from "openclaw/plugin-sdk";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk";
 import type { WebSocketLike } from "./mcp-manager.js";
@@ -20,6 +24,13 @@ interface XiaozhiAccount {
   enabled: boolean;
 }
 
+export interface XiaozhiWebSocketHeaders {
+  authorization?: string;
+  protocolVersion?: string;
+  deviceId?: string;
+  clientId?: string;
+}
+
 export class XiaozhiServer {
   private wss: WebSocketServer;
   private sessions = new Map<string, XiaozhiSession>();
@@ -31,18 +42,38 @@ export class XiaozhiServer {
     private log: Logger,
   ) {
     const httpServer = createServer();
-    this.wss = new WebSocketServer({ server: httpServer, maxPayload: 10 * 1024 * 1024 });
+    this.wss = new WebSocketServer({
+      server: httpServer,
+      maxPayload: 10 * 1024 * 1024,
+    });
 
-    this.wss.on("connection", (ws, path) => {
-      this.handleConnection(ws, path);
+    this.wss.on("connection", (ws: WebSocket, request) => {
+      this.handleConnection(ws, request);
     });
 
     (this as unknown as { _server?: HttpServer })._server = httpServer;
   }
 
-  private handleConnection(ws: import("ws").WebSocket, path: string): void {
-    const sessionId = Math.random().toString(36).slice(2, 10);
-    this.log.info?.(`[${sessionId}] ESP32 connected from ${ws.socket.remoteAddress}`);
+  private handleConnection(ws: WebSocket, request: import("http").IncomingMessage): void {
+    const connectionId = this.generateConnectionId();
+
+    // Extract headers per xiaozhi-esp32 spec
+    const headers: XiaozhiWebSocketHeaders = {
+      authorization: request.headers.authorization,
+      protocolVersion: request.headers["protocol-version"],
+      deviceId: request.headers["device-id"],
+      clientId: request.headers["client-id"],
+    };
+
+    this.log.info?.(`[${connectionId}] Device connecting from ${request.socket.remoteAddress}`);
+    this.log.info?.(`[${connectionId}] Headers: ${JSON.stringify(headers)}`);
+
+    // Validate required headers
+    if (!headers.deviceId) {
+      this.log.warn?.(`[${connectionId}] Missing Device-Id header, closing`);
+      ws.close(1008, "Missing Device-Id header");
+      return;
+    }
 
     // Wrap ws to match WebSocketLike interface
     const wsLike: WebSocketLike = {
@@ -50,7 +81,7 @@ export class XiaozhiServer {
         if (typeof data === "string") {
           ws.send(data, cb);
         } else {
-          ws.send(data, cb);
+          ws.send(data, { binary: true }, cb);
         }
       },
       on(event, listener) {
@@ -64,12 +95,12 @@ export class XiaozhiServer {
       },
     };
 
-    const mcp = new McpManager(sessionId, wsLike, this.log);
+    const mcp = new McpManager(connectionId, wsLike, this.log);
     const asr = createAsrProvider(this.config.asr, this.log);
     const tts = createTtsProvider(this.config.tts, this.log);
 
     const session = new XiaozhiSession(
-      sessionId,
+      connectionId,
       wsLike,
       this.config,
       mcp,
@@ -80,21 +111,25 @@ export class XiaozhiServer {
       this.log,
     );
 
-    this.sessions.set(sessionId, session);
+    this.sessions.set(connectionId, session);
 
     session.run().catch((err) => {
-      this.log.error?.(`[${sessionId}] Unexpected error: ${err}`);
+      this.log.error?.(`[${connectionId}] Unexpected error: ${err}`);
     }).finally(() => {
-      this.sessions.delete(sessionId);
-      this.log.info?.(`[${sessionId}] Session cleaned up`);
+      this.sessions.delete(connectionId);
+      this.log.info?.(`[${connectionId}] Session cleaned up`);
     });
+  }
+
+  private generateConnectionId(): string {
+    return Math.random().toString(36).slice(2, 10);
   }
 
   start(port: number): Promise<void> {
     return new Promise((resolve) => {
       const server = (this as unknown as { _server?: HttpServer })._server!;
       server.listen(port, () => {
-        this.log.info?.(`Xiaozhi server listening on ws://0.0.0.0:${port}`);
+        this.log.info?.(`xiaozhi server listening on ws://0.0.0.0:${port}`);
         resolve();
       });
     });

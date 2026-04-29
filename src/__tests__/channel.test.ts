@@ -13,7 +13,7 @@ describe("xiaozhiPlugin", () => {
   it("has correct meta information", () => {
     expect(xiaozhiPlugin.meta.id).toBe("xiaozhi");
     expect(xiaozhiPlugin.meta.name).toBe("Xiaozhi");
-    expect(xiaozhiPlugin.meta.description).toBe("Xiaozhi Protocol for ESP32 robots");
+    expect(xiaozhiPlugin.meta.description).toBe("Xiaozhi Protocol for ESP32 robots - OpenClaw replacement for xiaozhi cloud");
   });
 
   it("has capabilities defined", () => {

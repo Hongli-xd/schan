@@ -285,7 +285,7 @@ describe("Action parsing", () => {
     const { action, remainingText } = parseActionJson(text);
 
     expect(action).toEqual({ act: "idle", emo: "neutral" });
-    expect(remainingText).toBe("  大家好");
+    expect(remainingText).toBe("大家好");
   });
 
   it("handles action JSON only with no text", () => {

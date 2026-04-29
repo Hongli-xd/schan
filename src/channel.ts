@@ -1,12 +1,14 @@
 /**
  * Xiaozhi Channel Plugin
- * 实现小智协议，用于连接 ESP32 桌面机器人
+ * xiaozhi protocol for ESP32 robots
+ *
+ * Replaces xiaozhi cloud service with OpenClaw
  */
 
 import type { ChannelPlugin, Logger } from "openclaw/plugin-sdk";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk";
 import { XiaozhiServer } from "./server.js";
-import type { TtsProvider } from "./session.js";
+import type { TtsProvider, ReplyHandler } from "./session.js";
 import type { McpManager } from "./mcp-manager.js";
 import type { WebSocketLike } from "./mcp-manager.js";
 
@@ -27,15 +29,15 @@ const xiaozhiConfigSchema = {
 };
 
 /**
- * OpenClawReplyHandler - 实现 ReplyHandler 接口
+ * OpenClawReplyHandler - implements ReplyHandler interface
  *
- * 工作流程：
- * 1. 收到 ASR 文本后，调用 OpenClaw 的 reply pipeline
- * 2. OpenClaw 返回的 text 经过我们解析：提取动作 JSON 前缀
- * 3. 动作立刻通过 MCP 发给 ESP32（并发）
- * 4. 文本部分通过 TTS 流式播放给 ESP32
+ * Workflow:
+ * 1. Receive ASR text, call OpenClaw reply pipeline
+ * 2. Parse response for action JSON prefix
+ * 3. Execute actions via MCP (concurrent)
+ * 4. Stream TTS audio to ESP32
  */
-class OpenClawReplyHandler {
+class OpenClawReplyHandler implements ReplyHandler {
   private abortEvent = false;
 
   async reply(
@@ -49,7 +51,6 @@ class OpenClawReplyHandler {
     this.abortEvent = false;
     log.info?.(`Dispatching to OpenClaw: ${text.slice(0, 50)}...`);
 
-    // 检查 channelRuntime 是否可用
     if (!ctx.channelRuntime) {
       log.warn?.("channelRuntime not available - cannot use AI reply pipeline");
       return;
@@ -57,7 +58,6 @@ class OpenClawReplyHandler {
 
     const replyDispatcher = ctx.channelRuntime.reply;
 
-    // 构建 MsgContext
     const msgCtx = {
       Body: text,
       BodyForAgent: text,
@@ -67,24 +67,18 @@ class OpenClawReplyHandler {
       To: "openclaw",
     };
 
-    // 调用 OpenClaw 的 reply pipeline
     await replyDispatcher.dispatchReplyWithBufferedBlockDispatcher({
       ctx: msgCtx,
       cfg: ctx.cfg,
       dispatcherOptions: {
-        deliver: async (payload, _info) => {
-          // payload.text 可能包含动作 JSON 前缀
+        deliver: async (payload) => {
           const replyText = payload.text ?? "";
-
-          // 解析动作 JSON 前缀
           const { action, remainingText } = this.parseActionJson(replyText);
 
-          // 1. 立刻发送动作（并发）
           if (action) {
             void this.executeAction(action, mcp, log);
           }
 
-          // 2. TTS 流式播放
           await this.streamTts(remainingText, tts, ws, log);
         },
       },
@@ -95,6 +89,12 @@ class OpenClawReplyHandler {
     this.abortEvent = true;
     await new Promise((r) => setTimeout(r, 100));
     this.abortEvent = false;
+  }
+
+  async onMcpCall(name: string, args: Record<string, unknown>): Promise<void> {
+    // Handle MCP calls from device
+    // This is called when device calls tools on us (server)
+    console.log(`[MCP] Device calling tool: ${name}`, args);
   }
 
   private parseActionJson(text: string): { action: ActionJson | null; remainingText: string } {
@@ -117,13 +117,13 @@ class OpenClawReplyHandler {
 
     log.info?.(`Executing action: act=${act} emo=${emo} spd=${spd}`);
 
-    // 表情 → LED
+    // Emotion → LED
     const led = EMOTION_TO_LED[emo];
     if (led && led.some((v) => v > 0)) {
       void mcp.callTool("self.robot.set_led_color", { red: led[0], green: led[1], blue: led[2] });
     }
 
-    // 动作序列
+    // Action sequence
     const steps = ACTION_MAP[act] ?? [];
     for (const step of steps) {
       if (this.abortEvent) break;
@@ -154,7 +154,12 @@ class OpenClawReplyHandler {
 
         for await (const audio of tts.synthesizeStream(sent)) {
           if (this.abortEvent) break;
-          await ws.send(audio);
+          await new Promise<void>((resolve, reject) => {
+            ws.send(audio, (err?: Error) => {
+              if (err) reject(err);
+              else resolve();
+            });
+          });
         }
 
         await ws.send(JSON.stringify({ type: "tts", state: "sentence_end" }));
@@ -223,7 +228,7 @@ export const xiaozhiPlugin: ChannelPlugin<XiaozhiAccount> = {
   meta: {
     id: "xiaozhi",
     name: "Xiaozhi",
-    description: "Xiaozhi Protocol for ESP32 robots",
+    description: "Xiaozhi Protocol for ESP32 robots - OpenClaw replacement for xiaozhi cloud",
   },
   configSchema: xiaozhiConfigSchema,
 
@@ -264,7 +269,6 @@ export const xiaozhiPlugin: ChannelPlugin<XiaozhiAccount> = {
         tts: config.tts,
       };
 
-      // 创建 reply handler，传入 ctx 以访问 channelRuntime
       const replyHandler = new OpenClawReplyHandler();
       const server = new XiaozhiServer(xiaozhiConfig, replyHandler, ctx, log);
       await server.start(xiaozhiConfig.port);

@@ -1,6 +1,12 @@
 /**
- * MCP Manager - 与 ESP32 的 MCP 工具交互
- * 方向：OpenClaw（client）→ ESP32（server）
+ * MCP Manager - JSON-RPC 2.0 client for MCP communication
+ *
+ * This implements the client-side MCP:
+ * - Sends initialize to device
+ * - Sends tools/list to discover device capabilities
+ * - Calls tools on the device via tools/call
+ *
+ * Reference: xiaozhi-esp32/main/mcp_server.cc
  */
 
 import type { Logger } from "openclaw/plugin-sdk";
@@ -9,7 +15,6 @@ import type {
   McpTool,
 } from "./protocol.js";
 
-/** Minimal WebSocket interface we use */
 export interface WebSocketLike {
   send(data: string | Uint8Array, cb?: (err?: Error) => void): void;
   on(event: string, listener: (...args: unknown[]) => void): void;
@@ -33,7 +38,7 @@ export class McpManager {
   }> = [];
 
   constructor(
-    private sessionId: string,
+    private connectionId: string,
     private ws: WebSocketLike,
     private log: Logger,
   ) {}
@@ -46,9 +51,13 @@ export class McpManager {
     return this.toolSchemas;
   }
 
+  /**
+   * Initialize MCP connection with the device
+   * Sends initialize and tools/list
+   */
   async initialize(): Promise<void> {
     try {
-      // Step 1: initialize
+      // Step 1: Send initialize
       await this.sendMcp({
         jsonrpc: "2.0",
         method: "initialize",
@@ -59,9 +68,10 @@ export class McpManager {
         id: this.nextId(),
       });
 
+      // Wait for device to respond
       await new Promise((resolve) => setTimeout(resolve, 300));
 
-      // Step 2: tools/list
+      // Step 2: Request tool list from device
       await this.sendMcp({
         jsonrpc: "2.0",
         method: "tools/list",
@@ -83,15 +93,18 @@ export class McpManager {
           check();
         });
       } catch {
-        this.log.warn?.(`[${this.sessionId}] MCP tools/list timeout, continuing without tools`);
+        this.log.warn?.(`[${this.connectionId}] MCP tools/list timeout, continuing without tools`);
       }
 
-      this.log.info?.(`[${this.sessionId}] MCP tools discovered: ${this.tools.map((t) => t.name).join(", ") || "none"}`);
+      this.log.info?.(`[${this.connectionId}] MCP initialized, tools: ${this.tools.map((t) => t.name).join(", ") || "none"}`);
     } catch (err) {
-      this.log.warn?.(`[${this.sessionId}] MCP init failed: ${err}`);
+      this.log.warn?.(`[${this.connectionId}] MCP init failed: ${err}`);
     }
   }
 
+  /**
+   * Call a tool on the device
+   */
   async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     const callId = this.nextId();
 
@@ -115,17 +128,24 @@ export class McpManager {
       });
     });
 
-    this.log.debug?.(`MCP tool ${name} result: ${JSON.stringify(result)}`);
+    this.log.debug?.(`[${this.connectionId}] MCP tool ${name} result: ${JSON.stringify(result)}`);
     return result;
   }
 
-  onResult(payload: { id?: number | string; result?: unknown }): void {
+  /**
+   * Handle MCP response from device
+   */
+  onResult(payload: { id?: number | string; result?: unknown; error?: { code: number; message: string } }): void {
     if (payload.id == null) return;
     const callId = Number(payload.id);
     const pending = this.pending.get(callId);
     if (pending) {
       clearTimeout(pending.timeout);
-      pending.resolve(payload.result);
+      if (payload.error) {
+        pending.reject(new Error(`MCP error ${payload.error.code}: ${payload.error.message}`));
+      } else {
+        pending.resolve(payload.result);
+      }
       this.pending.delete(callId);
     }
 
@@ -144,8 +164,9 @@ export class McpManager {
   }
 
   private async sendMcp(payload: McpJsonRpcMessage): Promise<void> {
+    // Wrap in xiaozhi MCP message format
     const msg = JSON.stringify({ type: "mcp", payload });
-    await new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       this.ws.send(msg, (err?: Error) => {
         if (err) reject(err);
         else resolve();
@@ -164,7 +185,7 @@ export class McpManager {
     return {
       type: "function",
       function: {
-        name: tool.name.replace(".", "_"),
+        name: tool.name.replaceAll(".", "_"),
         description: tool.description ?? "",
         parameters: {
           type: "object",

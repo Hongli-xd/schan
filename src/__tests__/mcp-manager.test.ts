@@ -130,9 +130,9 @@ describe("McpManager", () => {
     const ws = createMockWs();
     const mcp = new McpManager("test-session", ws, mockLogger);
 
-    // Call a tool without waiting for response
-    const result = await mcp.callTool("self.robot.set_head_angles", { pitch: 20 });
-    expect(result).toBeNull(); // Should timeout and return null
+    // Call a tool without waiting for response - should timeout after 3 seconds
+    await expect(mcp.callTool("self.robot.set_head_angles", { pitch: 20 }))
+      .rejects.toThrow("MCP tool self.robot.set_head_angles call timeout");
   });
 });
 
