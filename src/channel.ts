@@ -49,14 +49,19 @@ class OpenClawReplyHandler implements ReplyHandler {
     ctx: ChannelGatewayContext<XiaozhiAccount>,
   ): Promise<void> {
     this.abortEvent = false;
-    log.info?.(`Dispatching to OpenClaw: ${text.slice(0, 50)}...`);
+    log.warn?.(`[DEBUG] OpenClawReplyHandler.reply CALLED with: ${text.slice(0, 100)}...`);
 
     if (!ctx.channelRuntime) {
       log.warn?.("channelRuntime not available - cannot use AI reply pipeline");
       return;
     }
 
-    const replyDispatcher = ctx.channelRuntime.reply;
+    const replyDispatcher = (ctx.channelRuntime as { reply?: unknown }).reply;
+
+    if (!replyDispatcher) {
+      log.warn?.("reply dispatcher not available");
+      return;
+    }
 
     const msgCtx = {
       Body: text,
@@ -67,7 +72,7 @@ class OpenClawReplyHandler implements ReplyHandler {
       To: "openclaw",
     };
 
-    await replyDispatcher.dispatchReplyWithBufferedBlockDispatcher({
+    await (replyDispatcher as { dispatchReplyWithBufferedBlockDispatcher: (opts: unknown) => Promise<void> }).dispatchReplyWithBufferedBlockDispatcher({
       ctx: msgCtx,
       cfg: ctx.cfg,
       dispatcherOptions: {
@@ -152,8 +157,13 @@ class OpenClawReplyHandler implements ReplyHandler {
 
         await ws.send(JSON.stringify({ type: "tts", state: "sentence_start", text: sent }));
 
+        let chunkIdx = 0;
         for await (const audio of tts.synthesizeStream(sent)) {
           if (this.abortEvent) break;
+          if (audio.length > 0) {
+            chunkIdx++;
+            log.debug?.(`[TTS] streaming chunk ${chunkIdx}: ${audio.length} bytes`);
+          }
           await new Promise<void>((resolve, reject) => {
             ws.send(audio, (err?: Error) => {
               if (err) reject(err);
@@ -161,6 +171,7 @@ class OpenClawReplyHandler implements ReplyHandler {
             });
           });
         }
+        log.info?.(`[TTS] streamed ${chunkIdx} chunks for sentence: ${sent.slice(0, 20)}`);
 
         await ws.send(JSON.stringify({ type: "tts", state: "sentence_end" }));
       }
@@ -261,7 +272,7 @@ export const xiaozhiPlugin: ChannelPlugin<XiaozhiAccount> = {
   gateway: {
     async startAccount(ctx) {
       const log = ctx.log ?? console;
-      const config = ctx.cfg.channels?.xiaozhi ?? {};
+      const config = (ctx.cfg.channels?.xiaozhi ?? {}) as { port?: number; asr?: unknown; tts?: unknown };
 
       const xiaozhiConfig = {
         port: config.port ?? 8765,
@@ -274,6 +285,20 @@ export const xiaozhiPlugin: ChannelPlugin<XiaozhiAccount> = {
       await server.start(xiaozhiConfig.port);
 
       log.info?.(`Xiaozhi gateway started on port ${xiaozhiConfig.port}`);
+
+      // Keep running until aborted (prevents gateway from thinking task is complete)
+      await new Promise<void>((resolve) => {
+        const sig = (ctx as { abortSignal?: { addEventListener: (e: string, fn: () => void) => void } }).abortSignal;
+        sig?.addEventListener("abort", () => {
+          server.stop();
+          resolve();
+        });
+      });
+    },
+
+    async stopAccount(ctx) {
+      // Trigger abort to unblock the Promise in startAccount
+      (ctx as { _abortController?: { abort: () => void } })._abortController?.abort();
     },
   },
 

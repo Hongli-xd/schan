@@ -1,9 +1,10 @@
 /**
  * TTS Provider - 语音合成provider
- * 支持 Edge-TTS（免费）和 CosyVoice（高质量）
+ * 支持 Edge-TTS（免费）和 Qwen3-TTS（DashScope HTTP，非流式）
  */
 
 import type { Logger } from "openclaw/plugin-sdk";
+import OpusScript from "opusscript";
 
 export interface TtsProvider {
   synthesizeStream(text: string): AsyncIterable<Buffer>;
@@ -15,97 +16,151 @@ interface TtsConfig {
   base_url?: string;
   voice?: string;
   speed?: number;
+  sample_rate?: number;
 }
 
 export function createTtsProvider(config: TtsConfig | undefined, log: Logger): TtsProvider {
   const provider = config?.provider ?? "edge-tts";
   log.info?.(`Creating TTS provider: ${provider}`);
 
-  if (provider === "edge-tts") {
-    return new EdgeTtsProvider(config ?? {}, log);
-  } else if (provider === "cosyvoice") {
-    return new CosyVoiceProvider(config ?? {}, log);
+  if (provider === "qwen3-tts") {
+    return new Qwen3TtsProvider(config ?? {}, log);
   } else {
     return new MockTtsProvider(log);
   }
 }
 
-class EdgeTtsProvider implements TtsProvider {
-  constructor(private config: TtsConfig, private log: Logger) {}
+/**
+ * Qwen3-TTS via DashScope HTTP SSE streaming.
+ * SSE events carry Base64-encoded PCM16 chunks via output.audio.data.
+ * Chunks are decoded and encoded to Opus on the fly.
+ */
+class Qwen3TtsProvider implements TtsProvider {
+  private sampleRate: number;
+  private baseUrl: string;
+  private apiKey: string;
 
-  async *synthesizeStream(text: string): AsyncIterable<Buffer> {
-    const voice = this.config.voice ?? "zh-CN-XiaoxiaoNeural";
-    const rate = this.config.speed != null && this.config.speed !== 1.0
-      ? `+${Math.round((this.config.speed - 1) * 100)}%`
-      : "+0%";
-
-    try {
-      // Edge-TTS requires the edge-tts npm package or we call the API differently
-      // For now, use HTTP API approach similar to Python version
-      this.log.info?.(`Edge-TTS streaming: ${text.slice(0, 20)}...`);
-
-      // TODO: Implement proper Edge-TTS streaming
-      // The Python version uses edge-tts library with stream()
-      // In TypeScript we could use edge-tts npm package or proxy
-
-      // For now, yield empty buffer to indicate no audio
-      yield Buffer.alloc(0);
-    } catch (err) {
-      this.log.error?.(`EdgeTTS error for '${text.slice(0, 20)}': ${err}`);
-    }
+  constructor(private config: TtsConfig, private log: Logger) {
+    this.sampleRate = this.config.sample_rate ?? 16000;
+    this.baseUrl = this.config.base_url ?? "https://dashscope.aliyuncs.com/api/v1";
+    this.apiKey = this.config.api_key ?? "";
   }
-}
-
-class CosyVoiceProvider implements TtsProvider {
-  constructor(private config: TtsConfig, private log: Logger) {}
 
   async *synthesizeStream(text: string): AsyncIterable<Buffer> {
+    if (!this.apiKey) {
+      this.log.error?.("Qwen3-TTS api_key not configured");
+      return;
+    }
+
+    const validRates = [8000, 12000, 16000, 24000, 48000] as const;
+    const sr = validRates.includes(this.sampleRate as typeof validRates[number]) ? this.sampleRate : 16000;
+    let opusEncoder: OpusScript;
     try {
-      const response = await fetch(`${this.config.base_url}/audio/speech`, {
+      opusEncoder = new OpusScript(sr as typeof validRates[number], 1, OpusScript.Application.AUDIO);
+    } catch (e) {
+      this.log.error?.(`Failed to create Opus encoder: ${e}`);
+      return;
+    }
+
+    try {
+      const resp = await fetch(`${this.baseUrl}/services/aigc/multimodal-generation/generation`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.config.api_key}`,
+          Authorization: `Bearer ${this.apiKey}`,
           "Content-Type": "application/json",
+          "X-DashScope-SSE": "enable",
         },
         body: JSON.stringify({
-          model: this.config.voice ?? "cosyvoice-v1-longvideo",
-          input: text,
-          voice: "longxiaochun",
-          response_format: "pcm",
-          sample_rate: 16000,
+          model: "qwen3-tts-flash",
+          input: {
+            text,
+            voice: this.config.voice ?? "Cherry",
+            language_type: "Chinese",
+          },
         }),
       });
 
-      if (!response.ok) {
-        this.log.error?.(`CosyVoice API error: ${response.status}`);
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        this.log.error?.(`Qwen3-TTS API error ${resp.status}: ${errText}`);
         return;
       }
 
-      // Stream PCM chunks and encode to Opus
-      const reader = response.body?.getReader();
-      if (!reader) return;
+      const reader = resp.body?.getReader();
+      if (!reader) {
+        this.log.error?.("Qwen3-TTS: no response body");
+        return;
+      }
 
-      // TODO: Encode PCM to Opus using opuslib
+      const decoder = new TextDecoder();
+      let remainder = "";
+      let prevPcmLen = 0;
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (value) {
-          yield value;
+        if (!value) continue;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = (remainder + chunk).split("\n");
+        remainder = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr || jsonStr === "[DONE]") continue;
+
+          try {
+            const event = JSON.parse(jsonStr) as {
+              output?: { audio?: { data?: string } };
+            };
+            const b64 = event?.output?.audio?.data;
+            if (!b64) continue;
+
+            const pcmBuffer = Buffer.from(b64, "base64");
+            if (pcmBuffer.length === 0) continue;
+
+            // Deduplication: only encode the NEW portion (incremental audio)
+            if (pcmBuffer.length <= prevPcmLen) continue;
+            const newPcm = pcmBuffer.subarray(prevPcmLen);
+            prevPcmLen = pcmBuffer.length;
+
+            if (newPcm.length === 0) continue;
+            try {
+              const frameSize = Math.floor(this.sampleRate * 0.06); // 960 samples for 60ms at 16kHz
+              let offset = 0;
+              while (offset + frameSize * 2 <= newPcm.length) {
+                const frame = newPcm.subarray(offset, offset + frameSize * 2);
+                const opus = opusEncoder.encode(frame, frameSize);
+                yield Buffer.from(opus);
+                offset += frameSize * 2;
+              }
+            } catch (e) {
+              this.log.debug?.(`Opus encode error: ${e}`);
+            }
+          } catch { /* skip malformed SSE data */ }
         }
       }
     } catch (err) {
-      this.log.error?.(`CosyVoice error: ${err}`);
+      this.log.error?.(`Qwen3-TTS error: ${err}`);
     }
   }
 }
 
 class MockTtsProvider implements TtsProvider {
-  constructor(private log: Logger) {}
+  private opusEncoder: OpusScript;
+  private sampleRate = 16000;
+
+  constructor(private log: Logger) {
+    this.opusEncoder = new OpusScript(16000 as 8000 | 12000 | 16000 | 24000 | 48000, 1, OpusScript.Application.AUDIO);
+  }
 
   async *synthesizeStream(text: string): AsyncIterable<Buffer> {
     this.log.info?.(`Mock TTS: ${text}`);
-    // Send 0.5s silence as mock audio
-    yield Buffer.alloc(16000 * 0.5 * 2); // 0.5s @ 16kHz 16-bit
-    await new Promise((r) => setTimeout(r, 100));
+    const frameSize = Math.floor(this.sampleRate * 0.06);
+    const silence = Buffer.alloc(frameSize * 2);
+    const opus = this.opusEncoder.encode(silence, frameSize);
+    yield Buffer.from(opus);
   }
 }

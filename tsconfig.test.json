@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "outDir": "./dist-test",
+    "strict": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": false,
+    "paths": {
+      "openclaw/plugin-sdk": ["./src/types/shim.d.ts"]
+    }
+  },
+  "include": ["test-simulator.ts"]
+}

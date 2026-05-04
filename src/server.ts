@@ -31,6 +31,9 @@ export interface XiaozhiWebSocketHeaders {
   clientId?: string;
 }
 
+// Global port registry — keyed by port number
+const portRegistry = new Map<number, boolean>();
+
 export class XiaozhiServer {
   private wss: WebSocketServer;
   private sessions = new Map<string, XiaozhiSession>();
@@ -59,10 +62,10 @@ export class XiaozhiServer {
 
     // Extract headers per xiaozhi-esp32 spec
     const headers: XiaozhiWebSocketHeaders = {
-      authorization: request.headers.authorization,
-      protocolVersion: request.headers["protocol-version"],
-      deviceId: request.headers["device-id"],
-      clientId: request.headers["client-id"],
+      authorization: String(request.headers.authorization ?? ""),
+      protocolVersion: String(request.headers["protocol-version"] ?? ""),
+      deviceId: String(request.headers["device-id"] ?? ""),
+      clientId: String(request.headers["client-id"] ?? ""),
     };
 
     this.log.info?.(`[${connectionId}] Device connecting from ${request.socket.remoteAddress}`);
@@ -126,9 +129,29 @@ export class XiaozhiServer {
   }
 
   start(port: number): Promise<void> {
-    return new Promise((resolve) => {
+    if (portRegistry.get(port) === true) {
+      this.log.info?.(`xiaozhi server already registered on port ${port}, skipping`);
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve, reject) => {
       const server = (this as unknown as { _server?: HttpServer })._server!;
+
+      const onError = (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE") {
+          portRegistry.set(port, true);
+          this.log.info?.(`xiaozhi server already running on port ${port}, skipping`);
+          resolve();
+        } else {
+          this.log.error?.(`xiaozhi server error: ${err}`);
+          reject(err);
+        }
+      };
+
+      server.once("error", onError);
+
       server.listen(port, () => {
+        portRegistry.set(port, true);
         this.log.info?.(`xiaozhi server listening on ws://0.0.0.0:${port}`);
         resolve();
       });
@@ -140,5 +163,6 @@ export class XiaozhiServer {
       // Sessions clean up on close
     }
     this.wss.close();
+    (this as unknown as { _server?: HttpServer })._server?.close();
   }
 }

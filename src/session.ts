@@ -20,6 +20,7 @@ import type {
   McpJsonRpcMessage,
 } from "./protocol.js";
 import { STACKCHAN_MCP_TOOLS } from "./protocol.js";
+import OpusScript from "opusscript";
 
 export interface AsrProvider {
   transcribe(audio: AsyncIterable<Buffer>): Promise<string>;
@@ -57,6 +58,7 @@ export class XiaozhiSession {
   private audioParams = { format: "opus" as const, sample_rate: 16000, channels: 1, frame_duration: 60 };
   private currentAsrTask: Promise<void> | null = null;
   private abortEvent = false;
+  private opusDecoder: OpusScript | null = null;
 
   constructor(
     private connectionId: string,
@@ -78,8 +80,13 @@ export class XiaozhiSession {
       void this.handleMessage(data);
     });
 
-    this.ws.on("close", () => {
-      this.log.info?.(`[${this.connectionId}] Connection closed`);
+    // Keep session alive until WebSocket closes
+    await new Promise<void>((resolve) => {
+      this.ws.on("close", () => {
+        this.log.info?.(`[${this.connectionId}] Connection closed`);
+        this.abortEvent = true;
+        resolve();
+      });
     });
   }
 
@@ -107,6 +114,11 @@ export class XiaozhiSession {
       audio_params: this.audioParams,
     };
 
+    // Initialize Opus decoder with the negotiated sample rate
+    const validRates = [8000, 12000, 16000, 24000, 48000] as const;
+    const sampleRate = validRates.includes(this.audioParams.sample_rate as typeof validRates[number]) ? this.audioParams.sample_rate : 16000;
+    this.opusDecoder = new OpusScript(sampleRate as 8000 | 12000 | 16000 | 24000 | 48000, this.audioParams.channels, OpusScript.Application.VOIP);
+
     await this.sendJson(serverHello);
     this.log.info?.(`[${this.connectionId}] Server hello sent, session_id: ${this.sessionId}`);
   }
@@ -116,10 +128,39 @@ export class XiaozhiSession {
   }
 
   private async handleMessage(data: unknown): Promise<void> {
-    if (data instanceof Buffer) {
-      await this.handleBinary(data);
-    } else if (typeof data === "string") {
+    // Handle text messages (JSON control)
+    if (typeof data === "string") {
       await this.handleText(data);
+      return;
+    }
+
+    // Handle binary messages - could be audio or JSON sent as binary
+    if (data instanceof Buffer || data instanceof Uint8Array) {
+      // Try to parse as JSON first - if it succeeds, treat as text message
+      const buf = data instanceof Buffer ? data : Buffer.from(data);
+      const str = buf.toString('utf8');
+      const trimmed = str.trim();
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+          JSON.parse(trimmed);
+          // It's JSON, treat as text message
+          await this.handleText(str);
+          return;
+        } catch {
+          // Not JSON, fall through to binary audio handling
+        }
+      }
+
+      // Discard very small binary messages that are likely not audio
+      // (Opus frames are typically 20-100+ bytes, JSON control messages are <200 bytes)
+      if (buf.length < 200 && this.state !== SessionState.LISTENING) {
+        this.log.debug?.(`[${this.connectionId}] Ignoring small binary (${buf.length} bytes) in state ${this.state}`);
+        return;
+      }
+
+      if (this.state === SessionState.LISTENING) {
+        this.audioQueue.push(buf);
+      }
     }
   }
 
@@ -160,6 +201,8 @@ export class XiaozhiSession {
     try {
       const msg = JSON.parse(raw) as XiaozhiJsonMessage & { session_id?: string };
       this.log.debug?.(`[${this.connectionId}] JSON msg: ${(msg as { type?: string }).type}`);
+
+      this.log.info?.(`[${this.connectionId}] handleText type: ${(msg as { type?: string }).type}`);
 
       switch ((msg as { type: string }).type) {
         case "hello":
@@ -320,7 +363,7 @@ export class XiaozhiSession {
   private async asrLoop(): Promise<void> {
     this.log.info?.(`[${this.connectionId}] ASR loop started`);
     try {
-      const audioIter = this.audioChunkIterable();
+      const audioIter = this.opusDecodeIterable();
       const finalText = await this.asr.transcribe(audioIter);
 
       if (this.abortEvent) return;
@@ -330,6 +373,8 @@ export class XiaozhiSession {
         this.state = SessionState.PROCESSING;
         await this.sendJson({ type: "stt", text: finalText });
         await this.replyHandler.reply(finalText, this.mcp, this.tts, this.ws, this.log, this.ctx);
+        // Multi-turn: reply done, ready for next listen cycle
+        this.state = SessionState.IDLE;
       } else {
         this.state = SessionState.IDLE;
       }
@@ -340,11 +385,21 @@ export class XiaozhiSession {
     }
   }
 
-  private async *audioChunkIterable(): AsyncIterable<Buffer> {
+  private async *opusDecodeIterable(): AsyncIterable<Buffer> {
+    const decoder = this.opusDecoder;
+    if (!decoder) {
+      this.log.error?.(`[${this.connectionId}] Opus decoder not initialized`);
+      return;
+    }
     while (true) {
       const chunk = await this.audioQueue.wait();
       if (chunk.length === 0 || this.abortEvent) break;
-      yield chunk;
+      try {
+        const pcm = decoder.decode(chunk);
+        yield Buffer.from(pcm);
+      } catch (err) {
+        this.log.debug?.(`[${this.connectionId}] Opus decode error: ${err}`);
+      }
     }
   }
 
