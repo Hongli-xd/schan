@@ -199,7 +199,7 @@ idf.py flash                # 烧录
 
 ```bash
 # 克隆本仓库
-cd stackchan
+cd schan
 
 # 安装依赖
 npm install
@@ -208,7 +208,7 @@ npm install
 npm run build
 
 # 在 OpenClaw 配置中添加插件路径
-# 或将 stackchan 目录软链接到 OpenClaw 的插件目录
+# 或将 schan 目录软链接到 OpenClaw 的插件目录
 ```
 
 ### 3. 配置 OpenClaw
@@ -237,7 +237,7 @@ npm run build
       "xiaozhi": { "enabled": true }
     },
     "load": {
-      "paths": ["/path/to/stackchan"]
+      "paths": ["/path/to/schan"]
     }
   }
 }
